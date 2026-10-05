@@ -1,0 +1,11 @@
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.5.0
+xgboost==2.0.3
+imbalanced-learn==0.12.3
+scapy==2.5.0
+pyshark==0.6
+flask==3.0.3
+flask-socketio==5.3.6
+matplotlib==3.9.0
+joblib==1.4.2

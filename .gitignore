@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.vscode/
+
+# Large NIDS datasets
+dataset/pcap/
+dataset/images/
+dataset/images_spotcheck/
+dataset/images_spotcheck2/
+
+# Large generated files
+files.txt

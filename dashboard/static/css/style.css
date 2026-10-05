@@ -1,0 +1,26 @@
+/* Custom CSS styling layers */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+::-webkit-scrollbar-track {
+    background: #020617; 
+}
+::-webkit-scrollbar-thumb {
+    background: #1e293b; 
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #334155; 
+}
+
+/* Glowing Pulsing Animations for Danger Badges */
+.badge-danger-glow {
+    box-shadow: 0 0 10px rgba(239, 68, 68, 0.4);
+    animation: alert-pulse 1.5s infinite alternate;
+}
+
+@keyframes alert-pulse {
+    0% { transform: scale(1); box-shadow: 0 0 10px rgba(239, 68, 68, 0.4); }
+    100% { transform: scale(1.02); box-shadow: 0 0 20px rgba(239, 68, 68, 0.7); }
+}
