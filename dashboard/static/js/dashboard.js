@@ -5,6 +5,8 @@ const socket = io();
 let throughputDataPoints = Array(20).fill(0);
 let throughputTimeLabels = Array(20).fill('');
 
+let previousPacketCount = 0;
+let previousPacketTimestamp = Date.now();
 // --- CHART 1: Real-Time Traffic Rate Line Chart Configuration ---
 const ctxLine = document.getElementById('throughputLineChart').getContext('2d');
 const throughputChart = new Chart(ctxLine, {
@@ -12,7 +14,7 @@ const throughputChart = new Chart(ctxLine, {
     data: {
         labels: throughputTimeLabels,
         datasets: [{
-            label: 'Flows Processing Rate / Sec',
+            label: 'Packets Processing Rate / Sec',
             data: throughputDataPoints,
             borderColor: '#3b82f6',
             backgroundColor: 'rgba(59, 130, 246, 0.05)',
@@ -61,7 +63,8 @@ const threatChart = new Chart(ctxDoughnut, {
 // --- UI ELEMENT MANAGER UTILITY FUNCTIONS ---
 function updateUIMetrics(stats) {
     document.getElementById('stat-packets').innerText = stats.total_packets_processed.toLocaleString();
-    document.getElementById('stat-normal').innerText = stats.threat_counts['Normal'].toLocaleString();
+    document.getElementById('stat-normal').innerText =
+    stats.total_flows_analyzed.toLocaleString();
     document.getElementById('stat-portscan').innerText = stats.threat_counts['Port Scan'].toLocaleString();
     document.getElementById('stat-bruteforce').innerText = stats.threat_counts['Brute Force'].toLocaleString();
     document.getElementById('stat-ddos').innerText = stats.threat_counts['DDoS'].toLocaleString();
@@ -145,12 +148,49 @@ socket.on('telemetry_update', function(data) {
     }
 
     // Step active throughput analytics counter visualization array windows indices
-    throughputDataPoints.push(data.global_stats.total_flows_analyzed);
-    throughputDataPoints.shift();
-    
-    const currentClockStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    throughputTimeLabels.push(currentClockStr);
-    throughputTimeLabels.shift();
+    // Calculate packet processing rate.
+const currentTimestamp = Date.now();
+const elapsedSeconds =
+    (currentTimestamp - previousPacketTimestamp) / 1000;
 
-    throughputChart.update();
+const currentPacketCount =
+    data.global_stats.total_packets_processed;
+
+let packetsPerSecond = 0;
+
+if (elapsedSeconds > 0) {
+    packetsPerSecond =
+        Math.max(
+            0,
+            (currentPacketCount - previousPacketCount)
+            / elapsedSeconds
+        );
+}
+
+previousPacketCount = currentPacketCount;
+previousPacketTimestamp = currentTimestamp;
+
+throughputDataPoints.push(
+    Number(packetsPerSecond.toFixed(2))
+);
+
+throughputDataPoints.shift();
+
+const currentClockStr =
+    new Date().toLocaleTimeString(
+        [],
+        {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        }
+    );
+
+throughputTimeLabels.push(
+    currentClockStr
+);
+
+throughputTimeLabels.shift();
+
+throughputChart.update();
 });

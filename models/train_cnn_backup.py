@@ -38,103 +38,54 @@ KERAS_MODEL_PATH = os.path.join(MODEL_OUT_DIR, "cnn_model.keras")
 
 def build_model() -> tf.keras.Model:
     """
-    Lightweight CNN for 4-class NIDS classification.
-
-    The original paper-based architecture was computationally expensive
-    on CPU because of the large number of filters and the 1486-wide input.
-
-    This version keeps the same CNN-based approach and 4-class output,
-    but uses fewer filters, progressive pooling, and GlobalAveragePooling2D
-    to make CPU training practical.
+    Table VII's best values:
+      conv1: 96 filters,  (5,5) kernel
+      conv2: 128 filters, (5,5) kernel
+      conv3: 192 filters, (3,3) kernel
+      conv4: 384 filters, (4,4) kernel
+      dense: 64 units
+      activation: ReLU (GlorotNormal init)
+      batchnorm after the first pooling layer
+      2 dropout layers at 0.2
+    All conv layers use 'same' padding, stride (1,1), exactly as the
+    paper specifies (Section IV-C) — this keeps spatial dims stable
+    through the conv stack so pooling is what shrinks the image.
     """
+    inputs = layers.Input(shape=(IMG_HEIGHT, IMG_WIDTH, IMG_CHANNELS))
+    x = layers.Rescaling(1.0 / 255.0)(inputs)  # uint8 0-255 -> float 0-1
 
-    inputs = layers.Input(
-        shape=(IMG_HEIGHT, IMG_WIDTH, IMG_CHANNELS)
-    )
-
-    # Normalize uint8 [0,255] -> float [0,1]
-    x = layers.Rescaling(1.0 / 255.0)(inputs)
-
-    # Block 1
-    x = layers.Conv2D(
-        16, (3, 3),
-        padding="same",
-        activation="relu",
-        kernel_initializer="glorot_normal"
-    )(x)
-    x = layers.MaxPooling2D(
-        pool_size=(2, 2),
-        padding="same"
-    )(x)
+    x = layers.Conv2D(96, (5, 5), padding="same", activation="relu",
+                       kernel_initializer="glorot_normal")(x)
+    x = layers.MaxPooling2D(pool_size=(2, 2), padding="same")(x)
     x = layers.BatchNormalization()(x)
 
-    # Block 2
-    x = layers.Conv2D(
-        32, (3, 3),
-        padding="same",
-        activation="relu",
-        kernel_initializer="glorot_normal"
-    )(x)
-    x = layers.MaxPooling2D(
-        pool_size=(2, 2),
-        padding="same"
-    )(x)
+    x = layers.Conv2D(128, (5, 5), padding="same", activation="relu",
+                       kernel_initializer="glorot_normal")(x)
+    x = layers.MaxPooling2D(pool_size=(2, 2), padding="same")(x)
     x = layers.Dropout(0.2)(x)
 
-    # Block 3
-    x = layers.Conv2D(
-        64, (3, 3),
-        padding="same",
-        activation="relu",
-        kernel_initializer="glorot_normal"
-    )(x)
-    x = layers.MaxPooling2D(
-        pool_size=(2, 2),
-        padding="same"
-    )(x)
+    x = layers.Conv2D(192, (3, 3), padding="same", activation="relu",
+                       kernel_initializer="glorot_normal")(x)
+    x = layers.MaxPooling2D(pool_size=(2, 2), padding="same")(x)
 
-    # Block 4
-    x = layers.Conv2D(
-        128, (3, 3),
-        padding="same",
-        activation="relu",
-        kernel_initializer="glorot_normal"
-    )(x)
-    x = layers.MaxPooling2D(
-        pool_size=(2, 2),
-        padding="same"
-    )(x)
+    x = layers.Conv2D(384, (4, 4), padding="same", activation="relu",
+                       kernel_initializer="glorot_normal")(x)
+    x = layers.MaxPooling2D(pool_size=(2, 2), padding="same")(x)
     x = layers.Dropout(0.2)(x)
 
-    # Avoid a huge Flatten layer.
-    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Flatten()(x)
+    x = layers.Dense(64, activation="relu",
+                      kernel_initializer="glorot_normal")(x)
+    outputs = layers.Dense(NUM_CLASSES, activation="softmax")(x)
 
-    x = layers.Dense(
-        64,
-        activation="relu",
-        kernel_initializer="glorot_normal"
-    )(x)
-
-    outputs = layers.Dense(
-        NUM_CLASSES,
-        activation="softmax"
-    )(x)
-
-    model = models.Model(
-        inputs,
-        outputs,
-        name="spin_ids_cnn_light"
-    )
-
+    model = models.Model(inputs, outputs, name="spin_ids_cnn")
     model.compile(
-        optimizer=tf.keras.optimizers.RMSprop(
-            learning_rate=0.001
-        ),
-        loss="sparse_categorical_crossentropy",
+        optimizer=tf.keras.optimizers.RMSprop(learning_rate=0.001),
+        loss="sparse_categorical_crossentropy",  # y is an int label, not one-hot
         metrics=["accuracy"],
     )
-
     return model
+
 
 def load_split(name: str):
     path = os.path.join(DATASET_DIR, f"{name}.npz")
@@ -166,8 +117,8 @@ def train():
     model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
-        epochs=15,            # paper used 100 epochs; EarlyStopping will cut this short
-        batch_size=64,        # paper's best batch size (Table VII)
+        epochs=100,            # paper used 100 epochs; EarlyStopping will cut this short
+        batch_size=256,        # paper's best batch size (Table VII)
         callbacks=callbacks,
     )
 

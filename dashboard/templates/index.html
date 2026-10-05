@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sahayak NIDS - Live Cyber Security Dashboard</title>
+    <title>Real-Time NIDS - Live Cyber Security Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <!-- <script src="https://cdn.cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.js"></script> -->
@@ -15,7 +15,7 @@
     <nav class="border-b border-slate-800 bg-slate-900/50 backdrop-blur px-6 py-4 flex justify-between items-center sticky top-0 z-50">
         <div class="flex items-center space-x-3">
             <div class="h-3 w-3 rounded-full bg-red-500 animate-pulse"></div>
-            <h1 class="text-xl font-bold tracking-wider text-slate-50 uppercase">Sahayak NIDS</h1>
+            <h1 class="text-xl font-bold tracking-wider text-slate-50 uppercase">Real-Time NIDS</h1>
             <span class="text-xs bg-slate-800 px-2.5 py-1 rounded-md text-slate-400 font-mono border border-slate-700">v1.0.0</span>
         </div>
         <div class="flex items-center space-x-4">
@@ -34,7 +34,7 @@
                 <p id="stat-packets" class="text-3xl font-bold font-mono mt-2 text-blue-400">0</p>
             </div>
             <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
-                <p class="text-xs uppercase tracking-wider font-semibold text-slate-400">Normal Traffic Flows</p>
+                <p class="text-xs uppercase tracking-wider font-semibold text-slate-400">TOTAL FLOWS ANALYZED</p>
                 <p id="stat-normal" class="text-3xl font-bold font-mono mt-2 text-emerald-400">0</p>
             </div>
             <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
@@ -46,14 +46,14 @@
                 <p id="stat-bruteforce" class="text-3xl font-bold font-mono mt-2 text-orange-500">0</p>
             </div>
             <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
-                <p class="text-xs uppercase tracking-wider font-semibold text-slate-400">DDoS Attacks Blocked</p>
+                <p class="text-xs uppercase tracking-wider font-semibold text-slate-400">DDoS Attacks Detected</p>
                 <p id="stat-ddos" class="text-3xl font-bold font-mono mt-2 text-red-500 animate-pulse">0</p>
             </div>
         </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <div class="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-5">
-                <h3 class="text-sm uppercase font-semibold tracking-wider text-slate-300 mb-4">Real-Time Traffic Rate Throughput</h3>
+                <h3 class="text-sm uppercase font-semibold tracking-wider text-slate-300 mb-4">Real-Time Packet Processing Rate</h3>
                 <div class="h-[280px]">
                     <canvas id="throughputLineChart"></canvas>
                 </div>

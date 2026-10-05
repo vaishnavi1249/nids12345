@@ -9,3 +9,5 @@ flask==3.0.3
 flask-socketio==5.3.6
 matplotlib==3.9.0
 joblib==1.4.2
+tensorflow==2.21.0
+dpkt

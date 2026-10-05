@@ -1,234 +1,556 @@
 import os
 import sys
 import datetime
-import pandas as pd
+
 import numpy as np
+import tensorflow as tf
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
-import joblib
 
-# Import our custom modules safely
 try:
     from packet_capture.sniffer import LivePacketSniffer
-except ImportError:
-    print("[-] Error: Make sure packet_capture and feature_extraction directories have empty __init__.py files.")
+except ImportError as e:
+    print(f"[-] Error importing packet capture modules: {e}")
     sys.exit(1)
 
-app = Flask(__name__, 
-            template_folder=os.path.join('dashboard', 'templates'),
-            static_folder=os.path.join('dashboard', 'static'))
-app.config['SECRET_KEY'] = 'nids_secret_security_key_2026'
 
-# Initialize SocketIO for real-time WebSocket communication
-socketio = SocketIO(app, cors_allowed_origins="*")
+# ============================================================
+# FLASK APPLICATION
+# ============================================================
 
-# Global counters tracking live metrics for dashboard indicators
+app = Flask(
+    __name__,
+    template_folder=os.path.join("dashboard", "templates"),
+    static_folder=os.path.join("dashboard", "static"),
+)
+
+app.config["SECRET_KEY"] = "nids_secret_security_key_2026"
+
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*"
+)
+
+
+# ============================================================
+# SYSTEM STATISTICS
+# ============================================================
+
 system_statistics = {
-    'total_packets_processed': 0,
-    'total_flows_analyzed': 0,
-    'threat_counts': {
-        'Normal': 0,
-        'Port Scan': 0,
-        'Brute Force': 0,
-        'DDoS': 0
+    "total_packets_processed": 0,
+    "total_flows_analyzed": 0,
+
+    "threat_counts": {
+        "Normal": 0,
+        "Port Scan": 0,
+        "Brute Force": 0,
+        "DDoS": 0,
     },
-    'current_risk_level': 'Safe' # Options: Safe (Normal only), Guarded (Minor attacks), Compromised (Severe DDoS)
+
+    "current_risk_level": "Safe",
 }
 
-# Historical alert log store (In-memory storage for dashboard initialization fetches)
+
 historical_alerts = []
-BENIGN_SERVICE_PORTS = {53, 5353, 1900, 5222, 67, 68, 123}  
 
-# Minimum confidence required to treat a non-Normal classification as a
-# real alert. Below this, the model is too unsure to act on - treat as Normal.
-CONFIDENCE_THRESHOLD = 75.0 
 
-# Load serialized ML components
-MODEL_PATH = os.path.join('models', 'best_model.pkl')
-SCALER_PATH = os.path.join('models', 'scaler.pkl')
-ENCODER_PATH = os.path.join('models', 'label_encoder.pkl')
+# ============================================================
+# CNN CONFIGURATION
+# ============================================================
 
-print("[*] Loading trained machine learning model artifacts...")
+CONFIDENCE_THRESHOLD = 75.0
+
+CLASS_NAMES = [
+    "Normal",
+    "Port Scan",
+    "Brute Force",
+    "DDoS",
+]
+
+
+MODEL_PATH = os.path.join(
+    "models",
+    "cnn_model_int8.tflite"
+)
+
+
+# ============================================================
+# LOAD TFLITE CNN MODEL
+# ============================================================
+
+print("[*] Loading INT8 TFLite CNN model...")
+
 try:
-    model = joblib.load(MODEL_PATH)
-    scaler = joblib.load(SCALER_PATH)
-    label_encoder = joblib.load(ENCODER_PATH)
-    print("[+] ML models loaded successfully. Ready for deployment pipeline pipeline.")
+
+    interpreter = tf.lite.Interpreter(
+        model_path=MODEL_PATH
+    )
+
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    input_index = input_details[0]["index"]
+    output_index = output_details[0]["index"]
+
+    input_shape = input_details[0]["shape"]
+
+    print("[+] TFLite CNN loaded successfully.")
+
+    print(
+        f"    Input shape: {input_shape}"
+    )
+
+    print(
+        f"    Input dtype: {input_details[0]['dtype']}"
+    )
+
+    print(
+        f"    Output dtype: {output_details[0]['dtype']}"
+    )
+
 except Exception as e:
-    print(f"[-] Error loading model artifacts: {e}")
-    print("[!] Please execute 'python notebooks/train_model.py' first to generate required artifacts.")
+
+    print(
+        f"[-] Error loading TFLite CNN: {e}"
+    )
+
+    print(
+        "[!] Make sure models/cnn_model_int8.tflite exists."
+    )
+
     sys.exit(1)
 
 
+# ============================================================
+# SEVERITY
+# ============================================================
+
 def determine_severity(attack_type):
-    """
-    Returns visual coloring layer markers based on threat class classification metrics.
-    """
-    if attack_type == 'DDoS':
-        return 'High', 'danger'
-    elif attack_type in ['Port Scan', 'Brute Force']:
-        return 'Medium', 'warning'
-    return 'Low', 'success'
+
+    if attack_type == "DDoS":
+        return "High", "danger"
+
+    if attack_type in [
+        "Port Scan",
+        "Brute Force"
+    ]:
+        return "Medium", "warning"
+
+    return "Low", "success"
 
 
-def pipeline_callback(flow_data):
-    """
-    This core function acts as the target callback runner for your live sniffer thread.
-    Every time a micro-flow window flushes, it flows straight into this model pipeline.
-    """
-    global system_statistics, historical_alerts
-    
-    # Update baseline flows count tracking
-    system_statistics['total_flows_analyzed'] += 1
-    system_statistics['total_packets_processed'] += flow_data['Packet Count']
+# ============================================================
+# CNN PREDICTION
+# ============================================================
 
-    # Extract target array tracking keys matching model fit configuration
-    # feature_columns = [
-    #     'Flow Duration', 'Packet Count', 'Bytes/sec', 'Packets/sec', 
-    #     'Protocol Type', 'SYN/ACK/FIN/RST Counts', 'Source Port', 'Destination Port'
-    # ]
-    
-    if int(flow_data['Source Port']) in BENIGN_SERVICE_PORTS or int(flow_data['Destination Port']) in BENIGN_SERVICE_PORTS:
-        return 
-    
-    feature_columns = [
-        'Flow Duration', 'Packet Count', 'Flow Bytes/s', 'Flow Packets/s', 
-        'Protocol', 'SYN/ACK/FIN/RST Counts', 'Source Port', 'Destination Port'
-    ]
+def predict_cnn(image):
 
-    # Map the flow dictionary into a standard 2D Pandas DataFrame array row
-    # flow_df = pd.DataFrame([{
-    #     'Flow Duration': flow_data['Flow Duration'],
-    #     'Packet Count': flow_data['Packet Count'],
-    #     'Bytes/sec': flow_data['Bytes/sec'],
-    #     'Packets/sec': flow_data['Packets/sec'],
-    #     'Protocol Type': flow_data['Protocol Type'],
-    #     'SYN/ACK/FIN/RST Counts': flow_data['SYN/ACK/FIN/RST Counts'],
-    #     'Source Port': flow_data['Source Port'],
-    #     'Destination Port': flow_data['Destination Port']
-    # }])
+    image = np.asarray(
+        image,
+        dtype=np.uint8
+    )
 
-    flow_df = pd.DataFrame([{
-        'Flow Duration': flow_data['Flow Duration'],
-        'Packet Count': flow_data['Packet Count'],
-        'Flow Bytes/s': flow_data['Bytes/sec'],
-        'Flow Packets/s': flow_data['Packets/sec'],
-        'Protocol': flow_data['Protocol Type'],
-        'SYN/ACK/FIN/RST Counts': flow_data['SYN/ACK/FIN/RST Counts'],
-        'Source Port': flow_data['Source Port'],
-        'Destination Port': flow_data['Destination Port']
-    }]) 
-    
+    if image.ndim == 3:
+
+        image = np.expand_dims(
+            image,
+            axis=0
+        )
+
+    expected_shape = tuple(
+        input_shape
+    )
+
+    if tuple(image.shape) != expected_shape:
+
+        raise ValueError(
+            f"Unexpected CNN input shape: "
+            f"{image.shape}; expected "
+            f"{expected_shape}"
+        )
+
+    interpreter.set_tensor(
+        input_index,
+        image
+    )
+
+    interpreter.invoke()
+
+    output = interpreter.get_tensor(
+        output_index
+    )[0]
+
+    predicted_index = int(
+        np.argmax(output)
+    )
+
+    confidence_score = float(
+        np.max(output) * 100.0
+    )
+
+    if (
+        0 <= predicted_index
+        < len(CLASS_NAMES)
+    ):
+
+        prediction_label = CLASS_NAMES[
+            predicted_index
+        ]
+
+    else:
+
+        prediction_label = "Normal"
+
+    return (
+        prediction_label,
+        confidence_score
+    )
+
+
+# ============================================================
+# CNN PIPELINE CALLBACK
+# ============================================================
+
+def pipeline_callback(
+    image,
+    flow_metadata
+):
+
+    global system_statistics
+    global historical_alerts
+
     try:
-        # Step A: Standard Normalization scaling 
-        scaled_features = scaler.transform(flow_df[feature_columns])
-        
-        # Step B: Model inference execution
-        prediction_encoded = model.predict(scaled_features)[0]
-        
-        # Step C: Inverse label decode back to string category ('Normal', 'DDoS', etc.)
-        prediction_label = label_encoder.inverse_transform([prediction_encoded])[0]
-        
-        # Calculate mock prediction probabilities matrix confidence scores if model supports it
-        try:
-            probabilities = model.predict_proba(scaled_features)[0]
-            confidence_score = float(np.max(probabilities) * 100)
-        except AttributeError:
-            confidence_score = 100.0 # Fallback default if solver lacks proba capabilities
-        
-        if confidence_score < CONFIDENCE_THRESHOLD and prediction_label != 'Normal':
-            prediction_label = 'Normal' 
-            
-        # Update counter maps matching metrics
-        if prediction_label in system_statistics['threat_counts']:
-            system_statistics['threat_counts'][prediction_label] += 1
-        else:
-            system_statistics['threat_counts']['Normal'] += 1
 
-        # Check global posture status conditions
-        if system_statistics['threat_counts']['DDoS'] > 5:
-            system_statistics['current_risk_level'] = 'Compromised'
-        elif (system_statistics['threat_counts']['Port Scan'] + system_statistics['threat_counts']['Brute Force']) > 0:
-            system_statistics['current_risk_level'] = 'Guarded'
-        else:
-            system_statistics['current_risk_level'] = 'Safe'
+        # ----------------------------------------------------
+        # Current flow checkpoint
+        # ----------------------------------------------------
 
-        # Formulate operational WebSocket telemetry payload structure
-        timestamp_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        severity_layer, custom_badge_css = determine_severity(prediction_label)
-        
+        packet_count = int(
+            flow_metadata["packet_count"]
+        )
+
+
+        # ----------------------------------------------------
+        # REAL LIVE SYSTEM COUNTERS
+        #
+        # These values are maintained by the sniffer.
+        # They are NOT prediction/checkpoint counts.
+        # ----------------------------------------------------
+
+        system_statistics[
+            "total_packets_processed"
+        ] = int(
+            flow_metadata[
+                "total_packets_processed"
+            ]
+        )
+
+        system_statistics[
+            "total_flows_analyzed"
+        ] = int(
+            flow_metadata[
+                "total_flows_analyzed"
+            ]
+        )
+
+
+        # ----------------------------------------------------
+        # CNN INFERENCE
+        # ----------------------------------------------------
+
+        prediction_label, confidence_score = predict_cnn(
+            image
+        )
+
+
+        # ----------------------------------------------------
+        # CONFIDENCE FILTER
+        # ----------------------------------------------------
+
+        if (
+            confidence_score
+            < CONFIDENCE_THRESHOLD
+            and prediction_label != "Normal"
+        ):
+
+            prediction_label = "Normal"
+
+
+        # ----------------------------------------------------
+        # THREAT COUNTERS
+        # ----------------------------------------------------
+
+        if (
+            prediction_label
+            in system_statistics[
+                "threat_counts"
+            ]
+        ):
+
+            system_statistics[
+                "threat_counts"
+            ][prediction_label] += 1
+
+
+        # ----------------------------------------------------
+        # CURRENT RISK LEVEL
+        # ----------------------------------------------------
+
+        if (
+            system_statistics[
+                "threat_counts"
+            ]["DDoS"] > 5
+        ):
+
+            system_statistics[
+                "current_risk_level"
+            ] = "Compromised"
+
+        elif (
+            system_statistics[
+                "threat_counts"
+            ]["Port Scan"]
+            +
+            system_statistics[
+                "threat_counts"
+            ]["Brute Force"]
+            > 0
+        ):
+
+            system_statistics[
+                "current_risk_level"
+            ] = "Guarded"
+
+        else:
+
+            system_statistics[
+                "current_risk_level"
+            ] = "Safe"
+
+
+        # ----------------------------------------------------
+        # TELEMETRY
+        # ----------------------------------------------------
+
+        timestamp_str = (
+            datetime.datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        )
+
+
+        severity_layer, custom_badge_css = (
+            determine_severity(
+                prediction_label
+            )
+        )
+
+
         telemetry_payload = {
-            'timestamp': timestamp_str,
-            'src_ip': flow_data['src_ip'],
-            'dst_ip': flow_data['dst_ip'],
-            'src_port': int(flow_data['Source Port']),
-            'dst_port': int(flow_data['Destination Port']),
-            'attack_type': prediction_label,
-            'severity': severity_layer,
-            'badge_css': custom_badge_css,
-            'confidence': f"{confidence_score:.2f}%",
-            'packet_count': flow_data['Packet Count'],
-            'bytes_per_sec': f"{flow_data['Bytes/sec']:.2f}"
+
+            "timestamp":
+                timestamp_str,
+
+            "src_ip":
+                flow_metadata["src_ip"],
+
+            "dst_ip":
+                flow_metadata["dst_ip"],
+
+            "src_port":
+                int(
+                    flow_metadata["src_port"]
+                ),
+
+            "dst_port":
+                int(
+                    flow_metadata["dst_port"]
+                ),
+
+            "attack_type":
+                prediction_label,
+
+            "severity":
+                severity_layer,
+
+            "badge_css":
+                custom_badge_css,
+
+            "confidence":
+                f"{confidence_score:.2f}%",
+
+            "packet_count":
+                packet_count,
+
+            "bytes_per_sec":
+                "N/A",
+
+            "detection_checkpoint":
+                packet_count,
         }
 
-        # Keep logs limited to last 100 events to manage RAM bounds footprint safely
-        if prediction_label != 'Normal':
-            historical_alerts.insert(0, telemetry_payload)
+
+        # ----------------------------------------------------
+        # STORE ATTACK ALERTS
+        # ----------------------------------------------------
+
+        if prediction_label != "Normal":
+
+            historical_alerts.insert(
+                0,
+                telemetry_payload
+            )
+
             if len(historical_alerts) > 100:
+
                 historical_alerts.pop()
 
-        # Stream active telemetry update broadcast to all dashboard clients connected live
-        socketio.emit('telemetry_update', {
-            'latest_event': telemetry_payload,
-            'global_stats': system_statistics
-        })
+
+        # ----------------------------------------------------
+        # SEND LIVE DASHBOARD UPDATE
+        # ----------------------------------------------------
+
+        socketio.emit(
+            "telemetry_update",
+            {
+                "latest_event":
+                    telemetry_payload,
+
+                "global_stats":
+                    system_statistics,
+            },
+        )
+
+
+        # ----------------------------------------------------
+        # TERMINAL OUTPUT
+        # ----------------------------------------------------
+
+        print(
+            f"[CNN] "
+            f"{prediction_label:<12} "
+            f"{confidence_score:6.2f}% "
+            f"| packet {packet_count} "
+            f"| "
+            f"{flow_metadata['src_ip']}:"
+            f"{flow_metadata['src_port']} "
+            f"→ "
+            f"{flow_metadata['dst_ip']}:"
+            f"{flow_metadata['dst_port']}"
+        )
+
 
     except Exception as e:
-        print(f"[-] Pipeline error processing active flow data array: {e}")
 
-# Instantiate Live Background Sniffer on all available interfaces by default
-sniffer = LivePacketSniffer(interface=None, callback=pipeline_callback)
+        print(
+            f"[-] CNN pipeline error: {e}"
+        )
 
-@app.route('/')
+
+# ============================================================
+# LIVE PACKET SNIFFER
+# ============================================================
+
+sniffer = LivePacketSniffer(
+    interface=None,
+    callback=pipeline_callback
+)
+
+
+# ============================================================
+# DASHBOARD ROUTES
+# ============================================================
+
+@app.route("/")
 def dashboard_home():
-    """
-    Renders core HTML layout shell template page.
-    """
-    return render_template('index.html')
 
-@app.route('/api/stats', methods=['GET'])
+    return render_template(
+        "index.html"
+    )
+
+
+@app.route(
+    "/api/stats",
+    methods=["GET"]
+)
 def get_current_stats():
-    """
-    API endpoint returning cumulative counter tracking maps data.
-    """
-    return jsonify(system_statistics)
 
-@app.route('/api/alerts', methods=['GET'])
+    return jsonify(
+        system_statistics
+    )
+
+
+@app.route(
+    "/api/alerts",
+    methods=["GET"]
+)
 def get_historical_alerts():
-    """
-    API endpoint returning array lists tracking malicious events history logs.
-    """
-    return jsonify(historical_alerts)
 
-@socketio.on('connect')
+    return jsonify(
+        historical_alerts
+    )
+
+
+# ============================================================
+# SOCKET.IO
+# ============================================================
+
+@socketio.on("connect")
 def handle_client_connection():
-    print(f"[*] Dashboard client linked dynamically via WebSockets. Connection ID: {request.sid}")
-    # Immediately push internal historical context logs maps back down the pipe
-    emit('initial_sync', {
-        'global_stats': system_statistics,
-        'alerts_history': historical_alerts
-    })
 
-if __name__ == '__main__':
-    # Start packet sniffer workers before spawning the Flask HTTP daemon loop
+    print(
+        "[*] Dashboard client linked dynamically "
+        "via WebSockets. "
+        f"Connection ID: {request.sid}"
+    )
+
+    emit(
+        "initial_sync",
+        {
+            "global_stats":
+                system_statistics,
+
+            "alerts_history":
+                historical_alerts,
+        }
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
     try:
+
         sniffer.start()
-        
-        # Run Flask server with websocket capabilities activated natively
-        # Note: Set host='0.0.0.0' to ensure local laboratory virtualization VMs can access dashboard link ports
-        socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
+        print(
+            "[+] Starting NIDS dashboard..."
+        )
+
+        socketio.run(
+            app,
+            host="0.0.0.0",
+            port=5000,
+            debug=False,
+            use_reloader=False
+        )
+
     except KeyboardInterrupt:
-        print("\n[*] Intercepted shutdown command sequence.")
+
+        print(
+            "\n[*] Intercepted shutdown command sequence."
+        )
+
     finally:
+
         sniffer.stop()
-        print("[+] Core orchestration engine safely terminated.")   
+
+        print(
+            "[+] Core orchestration engine "
+            "safely terminated."
+        )
