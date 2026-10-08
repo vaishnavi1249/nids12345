@@ -1,99 +1,620 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Real-Time NIDS - Live Cyber Security Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <!-- <script src="https://cdn.cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.js"></script> -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.js"></script>
-    <link rel="stylesheet" href="/static/css/style.css">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>Real-Time NIDS</title>
+
+    <link
+        rel="stylesheet"
+        href="{{ url_for('static', filename='css/style.css') }}"
+    >
+
+    <!-- Socket.IO -->
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased">
 
-    <nav class="border-b border-slate-800 bg-slate-900/50 backdrop-blur px-6 py-4 flex justify-between items-center sticky top-0 z-50">
-        <div class="flex items-center space-x-3">
-            <div class="h-3 w-3 rounded-full bg-red-500 animate-pulse"></div>
-            <h1 class="text-xl font-bold tracking-wider text-slate-50 uppercase">Real-Time NIDS</h1>
-            <span class="text-xs bg-slate-800 px-2.5 py-1 rounded-md text-slate-400 font-mono border border-slate-700">v1.0.0</span>
+<body>
+
+<div class="app">
+
+    <!-- =====================================================
+         HEADER
+         ===================================================== -->
+
+    <header class="topbar">
+
+        <div class="brand">
+
+            <div class="brand-mark">
+                N
+            </div>
+
+            <div>
+                <h1>Real-Time NIDS</h1>
+
+                <span>
+                    Network Intrusion Detection System
+                </span>
+            </div>
+
         </div>
-        <div class="flex items-center space-x-4">
-            <span class="text-sm text-slate-400 font-mono">System Posture:</span>
-            <span id="global-risk-badge" class="px-3 py-1 rounded font-bold tracking-wide uppercase text-sm border bg-emerald-500/10 text-emerald-400 border-emerald-500/20 shadow-[0_0_15px_rgba(16,185,129,0.1)]">
-                Safe
+
+
+        <div
+            class="connection"
+            aria-live="polite"
+        >
+
+            <span
+                id="connection-dot"
+                class="status-dot connecting"
+            ></span>
+
+            <span id="connection-text">
+                Connecting
             </span>
-        </div>
-    </nav>
 
-    <main class="p-6 space-y-6 max-w-[1600px] mx-auto">
-
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
-            <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
-                <p class="text-xs uppercase tracking-wider font-semibold text-slate-400">Total Packets</p>
-                <p id="stat-packets" class="text-3xl font-bold font-mono mt-2 text-blue-400">0</p>
-            </div>
-            <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
-                <p class="text-xs uppercase tracking-wider font-semibold text-slate-400">TOTAL FLOWS ANALYZED</p>
-                <p id="stat-normal" class="text-3xl font-bold font-mono mt-2 text-emerald-400">0</p>
-            </div>
-            <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
-                <p class="text-xs uppercase tracking-wider font-semibold text-slate-400">Port Scan Detected</p>
-                <p id="stat-portscan" class="text-3xl font-bold font-mono mt-2 text-amber-500">0</p>
-            </div>
-            <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
-                <p class="text-xs uppercase tracking-wider font-semibold text-slate-400">Brute Force Attempted</p>
-                <p id="stat-bruteforce" class="text-3xl font-bold font-mono mt-2 text-orange-500">0</p>
-            </div>
-            <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
-                <p class="text-xs uppercase tracking-wider font-semibold text-slate-400">DDoS Attacks Detected</p>
-                <p id="stat-ddos" class="text-3xl font-bold font-mono mt-2 text-red-500 animate-pulse">0</p>
-            </div>
         </div>
 
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div class="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-5">
-                <h3 class="text-sm uppercase font-semibold tracking-wider text-slate-300 mb-4">Real-Time Packet Processing Rate</h3>
-                <div class="h-[280px]">
-                    <canvas id="throughputLineChart"></canvas>
-                </div>
+    </header>
+
+
+    <!-- =====================================================
+         STATISTICS
+         ===================================================== -->
+
+    <section class="stats-grid">
+
+        <article class="stat-card">
+
+            <span class="stat-label">
+                PACKETS PROCESSED
+            </span>
+
+            <strong id="stat-packets">
+                0
+            </strong>
+
+            <span class="stat-sub">
+                Live captured traffic
+            </span>
+
+        </article>
+
+
+        <article class="stat-card">
+
+            <span class="stat-label">
+                FLOWS ANALYZED
+            </span>
+
+            <strong id="stat-flows">
+                0
+            </strong>
+
+            <span class="stat-sub">
+                Network flows
+            </span>
+
+        </article>
+
+
+        <article class="stat-card">
+
+            <span class="stat-label">
+                THREATS DETECTED
+            </span>
+
+            <strong id="stat-threats">
+                0
+            </strong>
+
+            <span class="stat-sub">
+                Security events
+            </span>
+
+        </article>
+
+
+        <article class="stat-card">
+
+            <span class="stat-label">
+                SYSTEM STATUS
+            </span>
+
+            <strong
+                id="stat-status"
+                class="status-safe"
+            >
+                ACTIVE
+            </strong>
+
+            <span class="stat-sub">
+                Real-time monitoring
+            </span>
+
+        </article>
+
+    </section>
+
+
+    <!-- =====================================================
+         LIVE TRAFFIC WAVE
+         ===================================================== -->
+
+    <section class="panel activity-panel">
+
+        <div class="panel-header">
+
+            <div>
+
+                <span class="eyebrow">
+                    NETWORK ACTIVITY
+                </span>
+
+                <h2>
+                    Live Traffic
+                </h2>
+
             </div>
-            <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
-                <h3 class="text-sm uppercase font-semibold tracking-wider text-slate-300 mb-4">Threat Classification Mix Breakdown</h3>
-                <div class="h-[280px] flex justify-center items-center">
-                    <canvas id="threatDoughnutChart"></canvas>
+
+
+            <div class="activity-summary">
+
+                <div>
+
+                    <span>
+                        PACKETS / SEC
+                    </span>
+
+                    <strong id="pps-value">
+                        0.00
+                    </strong>
+
                 </div>
+
+
+                <div>
+
+                    <span>
+                        FLOWS / SEC
+                    </span>
+
+                    <strong id="fps-value">
+                        0.00
+                    </strong>
+
+                </div>
+
             </div>
+
         </div>
 
-        <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
-            <div class="flex justify-between items-center mb-4">
-                <h3 class="text-sm uppercase font-semibold tracking-wider text-slate-300">Live Network Intrusion Incident Logs Table</h3>
-                <div class="text-xs font-mono text-slate-400 bg-slate-950 px-3 py-1.5 rounded border border-slate-800">
-                    Listening for anomalies...
-                </div>
+
+        <div class="wave-wrap">
+
+            <canvas
+                id="traffic-wave"
+                aria-label="Live packets per second graph"
+            ></canvas>
+
+            <div
+                id="wave-time-labels"
+                class="wave-axis"
+            >
             </div>
-            <div class="overflow-x-auto rounded-lg border border-slate-800 max-h-[350px] overflow-y-auto">
-                <table class="w-full text-left text-sm font-mono">
-                    <thead class="bg-slate-950 text-slate-400 uppercase text-xs tracking-wider sticky top-0 border-b border-slate-800">
+
+        </div>
+
+    </section>
+
+
+    <!-- =====================================================
+         MAIN MONITORING AREA
+         ===================================================== -->
+
+    <main class="main-grid">
+
+
+        <!-- =================================================
+             CURRENT DETECTION
+             ================================================= -->
+
+        <section class="panel detection-panel">
+
+            <div class="panel-header">
+
+                <div>
+
+                    <span class="eyebrow">
+                        LIVE DETECTION
+                    </span>
+
+                    <h2>
+                        Current Activity
+                    </h2>
+
+                </div>
+
+
+                <span
+                    id="detection-badge"
+                    class="badge normal"
+                >
+                    NORMAL
+                </span>
+
+            </div>
+
+
+            <div class="detection-content">
+
+                <span class="small-label">
+                    CLASSIFICATION
+                </span>
+
+
+                <h3 id="current-detection">
+                    Normal
+                </h3>
+
+
+                <p id="detection-description">
+                    No malicious activity detected.
+                </p>
+
+
+                <div class="confidence">
+
+                    <div class="confidence-top">
+
+                        <span>
+                            Confidence
+                        </span>
+
+                        <strong id="confidence-value">
+                            0.0%
+                        </strong>
+
+                    </div>
+
+
+                    <div class="confidence-bar">
+
+                        <div
+                            id="confidence-fill"
+                            class="confidence-fill"
+                        ></div>
+
+                    </div>
+
+                </div>
+
+
+                <div class="detection-meta">
+                    
+
+                    <div>
+
+                        <span>
+                            PACKETS
+                        </span>
+
+                        <strong id="detection-packets">
+                            —
+                        </strong>
+
+                    </div>
+
+
+                    <div>
+
+                        <span>
+                            CHECKPOINT
+                        </span>
+
+                        <strong id="detection-checkpoint">
+                            —
+                        </strong>
+
+                    </div>
+
+
+                    <div>
+
+                        <span>
+                            SEVERITY
+                        </span>
+
+                        <strong id="detection-severity">
+                            LOW
+                        </strong>
+
+                    </div>
+
+                </div>
+
+            </div>
+
+        </section>
+
+
+        <!-- =================================================
+             RISK
+             ================================================= -->
+
+        <section class="panel risk-panel">
+
+            <div class="panel-header">
+
+                <div>
+
+                    <span class="eyebrow">
+                        SECURITY STATUS
+                    </span>
+
+                    <h2>
+                        Risk Level
+                    </h2>
+
+                </div>
+
+            </div>
+
+
+            <div
+                id="risk-display"
+                class="risk-display safe"
+            >
+
+                <div
+                    id="risk-level"
+                    class="risk-level"
+                >
+                    SAFE
+                </div>
+
+
+                <p id="risk-description">
+                    No significant threats detected.
+                </p>
+
+            </div>
+
+
+            <div class="risk-footer">
+
+                <span>
+                    Last activity
+                </span>
+
+                <strong id="last-update">
+                    —
+                </strong>
+
+            </div>
+
+        </section>
+
+
+        <!-- =================================================
+             THREAT DISTRIBUTION
+             ================================================= -->
+
+        <section class="panel">
+
+            <div class="panel-header">
+
+                <div>
+
+                    <span class="eyebrow">
+                        THREAT ACTIVITY
+                    </span>
+
+                    <h2>
+                        Threat Distribution
+                    </h2>
+
+                </div>
+
+
+                <span class="panel-count">
+                    LIVE
+                </span>
+
+            </div>
+
+
+            <div
+                id="threat-list"
+                class="threat-list"
+            ></div>
+
+        </section>
+
+
+        <!-- =================================================
+             LIVE FLOW
+             ================================================= -->
+
+        <section class="panel">
+
+            <div class="panel-header">
+
+                <div>
+
+                    <span class="eyebrow">
+                        NETWORK FLOW
+                    </span>
+
+                    <h2>
+                        Latest Traffic
+                    </h2>
+
+                </div>
+
+            </div>
+
+
+            <div class="flow-details">
+
+                <div class="flow-row">
+
+                    <span>
+                        Source
+                    </span>
+
+                    <strong id="flow-source">
+                        —
+                    </strong>
+
+                </div>
+
+
+                <div class="flow-row">
+
+                    <span>
+                        Destination
+                    </span>
+
+                    <strong id="flow-destination">
+                        —
+                    </strong>
+
+                </div>
+
+
+                <div class="flow-row">
+
+                    <span>
+                        Protocol
+                    </span>
+
+                    <strong id="flow-protocol">
+                        —
+                    </strong>
+
+                </div>
+
+
+                <div class="flow-row">
+
+                    <span>
+                        Detection
+                    </span>
+
+                    <strong id="flow-detection">
+                        Normal
+                    </strong>
+
+                </div>
+
+
+                <div class="flow-row">
+
+                    <span>
+                        Time
+                    </span>
+
+                    <strong id="flow-time">
+                        —
+                    </strong>
+
+                </div>
+
+            </div>
+
+        </section>
+
+
+        <!-- =================================================
+             RECENT ALERTS
+             ================================================= -->
+
+        <section class="panel alerts-panel">
+
+            <div class="panel-header">
+
+                <div>
+
+                    <span class="eyebrow">
+                        SECURITY EVENTS
+                    </span>
+
+                    <h2>
+                        Recent Alerts
+                    </h2>
+
+                </div>
+
+
+                <span
+                    id="alert-count"
+                    class="panel-count"
+                >
+                    0 EVENTS
+                </span>
+
+            </div>
+
+
+            <div class="table-wrapper">
+
+                <table>
+
+                    <thead>
+
                         <tr>
-                            <th class="p-4">Timestamp</th>
-                            <th class="p-4">Source IP</th>
-                            <th class="p-4">Destination IP</th>
-                            <th class="p-4">Port (S/D)</th>
-                            <th class="p-4">Classification Class</th>
-                            <th class="p-4">Severity Level</th>
-                            <th class="p-4">Confidence Score</th>
+
+                            <th>TIME</th>
+                            <th>THREAT</th>
+                            <th>SOURCE</th>
+                            <th>DESTINATION</th>
+                            <th>CONFIDENCE</th>
+                            <th>SEVERITY</th>
+
                         </tr>
+
                     </thead>
-                    <tbody id="alert-logs-tbody" class="divide-y divide-slate-800/50">
-                        </tbody>
+
+
+                    <tbody id="alerts-body">
+
+                        <tr>
+
+                            <td
+                                colspan="6"
+                                class="empty"
+                            >
+                                No security alerts yet.
+                            </td>
+
+                        </tr>
+
+                    </tbody>
+
                 </table>
+
             </div>
-        </div>
+
+        </section>
 
     </main>
 
-    <script src="/static/js/dashboard.js"></script>
+</div>
+
+
+<!-- Dashboard JavaScript -->
+<script
+    src="{{ url_for('static', filename='js/dashboard.js') }}"
+></script>
+
 </body>
 </html>

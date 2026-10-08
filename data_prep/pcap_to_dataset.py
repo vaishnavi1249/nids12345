@@ -1,351 +1,1368 @@
 """
-pcap_to_dataset.py
+CIC-IDS2017 CSV -> 9-Class RGB Image Dataset
 
-This is the script you run ONCE your pcap has finished downloading.
-It does the offline, heavy-lifting version of what the live sniffer does
-packet-by-packet: reads a raw .pcap file, groups packets into flows,
-figures out which flows are attacks (using CICIDS2017's labelled CSV),
-and builds training images out of them.
+CSV-only dataset builder.
 
-Pipeline:
-  pcap file  --(dpkt, streamed)-->  per-packet ParsedPacket
-             --(grouped by 5-tuple)-->  per-flow packet lists
-             --(labelled via ground-truth CSV)-->  flow -> class
-             --(FlowImageBuilder)-->  one image per flow per packet-count
-             --(70/15/15 split)-->  train.npz / val.npz / test.npz
+This version intentionally does NOT:
+- read PCAP files
+- perform PCAP/CSV timestamp calibration
+- match flows back to PCAP packets
 
-Ground truth CSV: CICIDS2017's "GeneratedLabelledFlows" CSVs have columns
-including Source IP, Destination IP, Source Port, Destination Port,
-Protocol, Timestamp, and Label. We match each flow we built from the
-pcap to a row in this CSV using the same 5-tuple + nearest timestamp,
-same as the base paper's validation approach (Section IV-A).
+It directly uses the labelled CIC-IDS2017 flow CSV files.
 
-IMPORTANT — this file is written to be CORRECT, not yet RUN, because the
-real .pcap and ground-truth CSV aren't downloaded yet. Its self-test at
-the bottom proves the logic on a tiny synthetic example. Once your real
-files are in place, run it for real:
+Output:
+    dataset/images_final/
+        train.npz
+        val.npz
+        test.npz
 
-    python data_prep/pcap_to_dataset.py \\
-        --pcap dataset/pcap/Tuesday-WorkingHours.pcap \\
-        --labels dataset/pcap/Tuesday-WorkingHours.pcap_ISCX.csv \\
-        --out dataset/images
+Each sample:
+    shape = (9, 1486, 3)
+
+Classes:
+    0 Normal
+    1 DoS
+    2 DDoS
+    3 Port Scan
+    4 Brute Force
+    5 Botnet
+    6 Web Attack
+    7 Infiltration
+    8 Heartbleed
 """
 
 import argparse
 import os
-from collections import defaultdict
+from collections import Counter
 
-import dpkt
 import numpy as np
 import pandas as pd
 
-from feature_extraction.packet_parser import parse_packet
-from feature_extraction.image_builder import FlowImageBuilder, P_PACKETS, Q_FEATURES
 
-# Map CICIDS2017's many fine-grained label strings onto your project's
-# 4 classes (same mapping logic your teammate used in train_model.py's
-# clean_labels(), kept consistent so both pipelines agree on classes).
-LABEL_MAP = {
-    "normal": 0, "benign": 0,
-    "portscan": 1, "port scan": 1,
-    "ftp-patator": 2, "ssh-patator": 2, "brute force": 2,
-    "ddos": 3, "dos": 3, "dos hulk": 3, "dos goldeneye": 3,
-    "dos slowloris": 3, "dos slowhttptest": 3,
-}
-CLASS_NAMES = ["Normal", "Port Scan", "Brute Force", "DDoS"]
+# ============================================================
+# PROJECT CLASSES
+# ============================================================
+
+CLASS_NAMES = [
+    "Normal",
+    "DoS",
+    "DDoS",
+    "Port Scan",
+    "Brute Force",
+    "Botnet",
+    "Web Attack",
+    "Infiltration",
+    "Heartbleed",
+]
+
 NUM_CLASSES = len(CLASS_NAMES)
 
+# CNN input expected by the existing project.
+IMAGE_HEIGHT = 9
+IMAGE_WIDTH = 1486
+IMAGE_CHANNELS = 3
 
-def map_label(raw_label: str):
-    key = str(raw_label).strip().lower()
-    for substr, cls in LABEL_MAP.items():
-        if substr in key:
-            return cls
-    return None  # Ignore labels not belonging to our 4 project classes
+IMAGE_SHAPE = (
+    IMAGE_HEIGHT,
+    IMAGE_WIDTH,
+    IMAGE_CHANNELS,
+)
 
-def load_ground_truth(csv_paths: list[str]) -> pd.DataFrame:
+
+# ============================================================
+# LABEL MAP
+# ============================================================
+
+LABEL_MAP = {
+    # Normal
+    "normal": 0,
+    "benign": 0,
+
+    # DoS
+    "dos": 1,
+    "dos hulk": 1,
+    "dos goldeneye": 1,
+    "dos slowloris": 1,
+    "dos slowhttptest": 1,
+
+    # DDoS
+    "ddos": 2,
+
+    # Port Scan
+    "portscan": 3,
+    "port scan": 3,
+
+    # Brute Force
+    "ftp-patator": 4,
+    "ssh-patator": 4,
+    "brute force": 4,
+
+    # Botnet
+    "bot": 5,
+    "botnet": 5,
+
+    # Web Attack
+    "web attack brute force": 6,
+    "web attack xss": 6,
+    "web attack sql injection": 6,
+
+    # Infiltration
+    "infiltration": 7,
+
+    # Heartbleed
+    "heartbleed": 8,
+}
+
+
+# ============================================================
+# LABEL NORMALIZATION
+# ============================================================
+
+def normalize_label(label):
+    if label is None:
+        return ""
+
+    text = str(label)
+
+    # Remove weird CIC encoding variants.
+    text = (
+        text.replace("\x96", "-")
+        .replace("\x97", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+    )
+
+    text = " ".join(
+        text.strip().lower().split()
+    )
+
+    return text
+
+
+def map_label(label):
+    key = normalize_label(label)
+
+    if key in LABEL_MAP:
+        return LABEL_MAP[key]
+
+    # Tolerant Web Attack handling.
+    if key.startswith("web attack"):
+        if "brute force" in key:
+            return 6
+
+        if "xss" in key:
+            return 6
+
+        if "sql injection" in key:
+            return 6
+
+    # Tolerant DoS handling.
+    if key.startswith("dos "):
+        return 1
+
+    return None
+
+
+# ============================================================
+# FIND LABEL COLUMN
+# ============================================================
+
+def find_label_column(df):
+    for column in df.columns:
+        clean = str(column).strip().lower()
+
+        if clean == "label":
+            return column
+
+    raise ValueError(
+        "Could not find 'Label' column.\n"
+        f"Available columns: {list(df.columns)}"
+    )
+
+
+# ============================================================
+# CLEAN NUMERIC FEATURES
+# ============================================================
+
+def clean_feature_dataframe(df):
     """
-    Loads one or more CICIDS2017 labelled-flow CSVs and normalises column
-    names, since different CICFlowMeter versions spell them slightly
-    differently.
+    Keep only numeric flow features.
 
-    IMPORTANT: Friday's traffic is split across 3 CSVs on the mirrors
-    (Morning, Afternoon-DDos, Afternoon-PortScan) even though the pcap
-    itself is one whole-day file. Pass ALL of a day's label CSVs here,
-    or benign flows that happened to fall in a CSV you didn't include
-    will have no match and get silently dropped by build_flow_label_lookup
-    -> you'd end up short on the Normal class without any error being
-    raised.
+    Removes:
+        Flow ID
+        Source IP
+        Destination IP
+        Timestamp
+        Label
+
+    Handles:
+        NaN
+        +Infinity
+        -Infinity
+        duplicated feature columns
     """
-    frames = []
-    for csv_path in csv_paths:
-        df = pd.read_csv(csv_path, encoding="latin1")
-        df.columns = df.columns.str.strip()
-        rename_map = {
-            "Src IP": "Source IP", "Dst IP": "Destination IP",
-            "Src Port": "Source Port", "Dst Port": "Destination Port",
-        }
-        df = df.rename(columns=rename_map)
-        required = ["Source IP", "Destination IP", "Source Port",
-                    "Destination Port", "Protocol", "Label"]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise ValueError(f"{csv_path} is missing columns: {missing}. "
-                              f"Found columns: {list(df.columns)}")
-        frames.append(df)
-    merged = pd.concat(frames, ignore_index=True)
-    print(f"[*] Loaded {len(merged)} ground-truth flow labels from "
-          f"{len(csv_paths)} CSV file(s).")
-    return merged
 
+    work = df.copy()
 
-def build_flow_label_lookup(gt_df: pd.DataFrame) -> dict:
-    """
-    Builds a dict keyed by the SAME direction-normalised 5-tuple that
-    ParsedPacket.flow_key uses, so lookups are a simple dict hit.
-    If CICFlowMeter logged duplicate flows for the same 5-tuple (happens
-    with long-running/overlapping flows) we keep the LAST one, same
-    simplification as most reproductions of this dataset use.
-    """
-    lookup = {}
-    for _, row in gt_df.iterrows():
-        a = (str(row["Source IP"]), int(row["Source Port"]))
-        b = (str(row["Destination IP"]), int(row["Destination Port"]))
-        proto = int(row["Protocol"])
-        if a <= b:
-            key = (a[0], b[0], a[1], b[1], proto)
-        else:
-            key = (b[0], a[0], b[1], a[1], proto)
-        mapped = map_label(row["Label"])
-        if mapped is not None:
-            lookup[key] = mapped
-    return lookup
+    # Clean column names.
+    work.columns = [
+        str(column).strip()
+        for column in work.columns
+    ]
 
+    label_column = find_label_column(work)
 
-def stream_pcap_to_flows(pcap_paths: list[str], max_packets: int | None = None):
-    """
-    Streams one or more pcaps with dpkt (never loads a whole file into
-    memory — important for a 10GB file) and groups parsed packets by
-    flow_key, across all given files. max_packets, if given, applies
-    PER FILE (so passing 2 files with max_packets=100000 reads up to
-    100000 packets from each, not 100000 total) — handy for a quick
-    spot-check across both Friday and Tuesday at once.
+    # Preserve labels separately.
+    raw_labels = work[label_column].copy()
 
-    Note: flow_key collisions across different pcap files (e.g. the
-    exact same IP:port:protocol 5-tuple happening to recur on both
-    Friday and Tuesday) are treated as the same flow here. In practice
-    this essentially never happens across different capture days/times,
-    so it's a safe simplification — but it's why we don't bother
-    namespacing flow keys per file.
-    """
-    flows: dict[tuple, list] = defaultdict(list)
-    for pcap_path in pcap_paths:
-        n_seen, n_parsed = 0, 0
-        with open(pcap_path, "rb") as f:
-            magic = f.read(4)
-            f.seek(0)
+    # Remove non-feature columns.
+    remove_columns = []
 
-            if magic == b"\x0a\x0d\x0d\x0a":
-                reader = dpkt.pcapng.Reader(f)
-            else:
-                reader = dpkt.pcap.Reader(f)
-            for ts, buf in reader:
-                n_seen += 1
-                parsed = parse_packet(buf, ts)
-                if parsed is not None:
-                    n_parsed += 1
-                    flows[parsed.flow_key].append(parsed)
-                if max_packets is not None and n_seen >= max_packets:
-                    break
-        print(f"[*] {pcap_path}: streamed {n_seen} packets, parsed {n_parsed} "
-              f"(TCP/UDP IPv4).")
-    print(f"[*] Grouped into {len(flows)} flows total across "
-          f"{len(pcap_paths)} file(s).")
-    return flows
+    for column in work.columns:
+        clean = str(column).strip().lower()
 
+        if clean in {
+            "flow id",
+            "source ip",
+            "destination ip",
+            "timestamp",
+            "src ip",
+            "dst ip",
+        }:
+            remove_columns.append(column)
 
-def build_images_for_flow(packets: list) -> list[np.ndarray]:
-    """
-    Per the paper's approach (Table VI), we don't make just ONE image
-    per flow — we make one image for EACH packet count from 1 up to
-    P_PACKETS, so the model learns what a flow looks like after 1
-    packet, after 2, ... after 9. This is what lets the live dashboard
-    predict early (at packet 4) with the same model trained for packet 9.
-    Returns a list of up to P_PACKETS images (fewer if the flow itself
-    has fewer than P_PACKETS packets total).
-    """
-    builder = FlowImageBuilder()
-    images = []
-    for pkt in packets[:P_PACKETS]:
-        builder.add_packet(pkt)
-        images.append(builder.get_image().copy())
-    return images
+    remove_columns.append(label_column)
 
+    feature_df = work.drop(
+        columns=list(
+            dict.fromkeys(remove_columns)
+        ),
+        errors="ignore",
+    )
 
-def build_dataset(pcap_paths: list[str], labels_csv_paths: list[str], out_dir: str,
-                  max_packets: int | None = None, seed: int = 42,
-                  max_images_per_class: int | None = 15000):
+    # Convert everything remaining to numeric.
+    feature_df = feature_df.apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
 
-    rng = np.random.default_rng(seed)
+    # Remove columns that became completely empty.
+    feature_df = feature_df.dropna(
+        axis=1,
+        how="all",
+    )
 
-    gt_df = load_ground_truth(labels_csv_paths)
-    label_lookup = build_flow_label_lookup(gt_df)
+    # Replace infinite values.
+    feature_df = feature_df.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
 
-    flows = stream_pcap_to_flows(pcap_paths, max_packets=max_packets)
+    # Fill missing values using column medians.
+    for column in feature_df.columns:
 
-    # Shuffle flow order so the class cap does not depend on PCAP order.
-    flow_items = list(flows.items())
-    rng.shuffle(flow_items)
+        values = feature_df[column]
 
-    all_images = []
-    all_labels = []
+        median = values.median()
 
-    class_counts = {i: 0 for i in range(NUM_CLASSES)}
-    unmatched = 0
-    capped = 0
+        if pd.isna(median):
+            median = 0.0
 
-    for flow_key, packets in flow_items:
-
-        if flow_key not in label_lookup:
-            unmatched += 1
-            continue
-
-        label = label_lookup[flow_key]
-
-        if max_images_per_class is not None and class_counts[label] >= max_images_per_class:
-            capped += 1
-            continue
-
-        for img in build_images_for_flow(packets):
-
-            if max_images_per_class is not None and class_counts[label] >= max_images_per_class:
-                break
-
-            all_images.append(img)
-            all_labels.append(label)
-            class_counts[label] += 1
-
-    print(f"[*] {unmatched}/{len(flows)} flows had no matching ground-truth "
-          f"label and were skipped.")
-
-    if capped:
-        print(f"[*] {capped} flows skipped — their class already hit the "
-              f"{max_images_per_class}-image cap.")
-
-    print(f"[*] Built {len(all_images)} images total.")
-
-    for cls_idx, cls_name in enumerate(CLASS_NAMES):
-        print(f"    {cls_name}: {class_counts[cls_idx]}")
-
-    if any(c == 0 for c in class_counts.values()):
-        missing = [CLASS_NAMES[i] for i, c in class_counts.items() if c == 0]
-        print(f"[!] WARNING: these classes have ZERO images: {missing}. "
-              f"Check you passed the right label CSVs for this pcap.")
-
-    # Convert the collected images to one NumPy array.
-    X = np.stack(all_images).astype(np.uint8)
-    y = np.array(all_labels, dtype=np.int64)
-
-    idx = rng.permutation(len(X))
-    n = len(X)
-
-    n_train = int(n * 0.70)
-    n_val = int(n * 0.15)
-
-    splits = {
-        "train": idx[:n_train],
-        "val": idx[n_train:n_train + n_val],
-        "test": idx[n_train + n_val:],
-    }
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    for name, split_idx in splits.items():
-
-        path = os.path.join(out_dir, f"{name}.npz")
-
-        np.savez_compressed(
-            path,
-            X=X[split_idx],
-            y=y[split_idx]
+        feature_df[column] = values.fillna(
+            median
         )
 
-        print(f"[+] Wrote {path} ({len(split_idx)} samples)")
+    # Final safety conversion.
+    feature_df = feature_df.astype(
+        np.float32
+    )
 
-def _self_test():
-    """
-    Proves the whole pipeline — pcap -> flows -> label lookup -> images
-    -> saved .npz — works correctly, using a tiny synthetic pcap and a
-    tiny synthetic ground-truth CSV instead of real CICIDS2017 files.
-    """
-    import tempfile
-    from scapy.all import Ether, IP, TCP, Raw, wrpcap
+    return feature_df, raw_labels
 
-    tmp_dir = tempfile.mkdtemp()
-    pcap_path = os.path.join(tmp_dir, "self_test.pcap")
-    labels_path = os.path.join(tmp_dir, "self_test_labels.csv")
-    out_dir = os.path.join(tmp_dir, "images")
 
-    # Flow A: 10.0.0.1 <-> 10.0.0.2 on port 80 -> labelled DDoS
-    # Flow B: 10.0.0.3 <-> 10.0.0.4 on port 22 -> labelled BENIGN
-    pkts = [
-        Ether() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP(sport=5000, dport=80, flags="S"),
-        Ether() / IP(src="10.0.0.2", dst="10.0.0.1") / TCP(sport=80, dport=5000, flags="SA"),
-        Ether() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP(sport=5000, dport=80, flags="A") / Raw(b"x" * 50),
-        Ether() / IP(src="10.0.0.3", dst="10.0.0.4") / TCP(sport=6000, dport=22, flags="S"),
-        Ether() / IP(src="10.0.0.4", dst="10.0.0.3") / TCP(sport=22, dport=6000, flags="SA"),
+# ============================================================
+# CSV LOADING
+# ============================================================
+
+def load_csv_file(csv_path):
+    print()
+    print("=" * 70)
+    print(f"[*] Loading: {csv_path}")
+    print("=" * 70)
+
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"CSV not found: {csv_path}"
+        )
+
+    df = pd.read_csv(
+        csv_path,
+        encoding="latin1",
+        low_memory=False,
+    )
+
+    print(
+        f"[*] Rows loaded: {len(df):,}"
+    )
+
+    print(
+        f"[*] Columns: {len(df.columns)}"
+    )
+
+    feature_df, raw_labels = (
+        clean_feature_dataframe(df)
+    )
+
+    labels = []
+
+    for label in raw_labels:
+        labels.append(
+            map_label(label)
+        )
+
+    labels = np.array(
+    [
+        -1 if label is None else int(label)
+        for label in labels
+    ],
+    dtype=np.int64,
+)
+
+    valid_mask = labels >= 0
+
+    feature_df = feature_df.loc[
+        valid_mask
+    ].reset_index(drop=True)
+
+    labels = labels[
+        valid_mask
     ]
-    wrpcap(pcap_path, pkts)
 
-    gt = pd.DataFrame([
-        {"Source IP": "10.0.0.1", "Destination IP": "10.0.0.2",
-         "Source Port": 5000, "Destination Port": 80, "Protocol": 6, "Label": "DDoS"},
-        {"Source IP": "10.0.0.3", "Destination IP": "10.0.0.4",
-         "Source Port": 6000, "Destination Port": 22, "Protocol": 6, "Label": "BENIGN"},
-    ])
-    gt.to_csv(labels_path, index=False)
+    print(
+        f"[*] Usable labelled rows: "
+        f"{len(labels):,}"
+    )
 
-    build_dataset([pcap_path], [labels_path], out_dir, max_images_per_class=None)
+    print(
+        f"[*] Numeric features: "
+        f"{feature_df.shape[1]}"
+    )
 
-    train = np.load(os.path.join(out_dir, "train.npz")) if os.path.exists(os.path.join(out_dir, "train.npz")) else None
-    total = 0
-    for name in ("train", "val", "test"):
-        p = os.path.join(out_dir, f"{name}.npz")
-        if os.path.exists(p):
-            d = np.load(p)
-            total += len(d["X"])
-            assert d["X"].shape[1:] == (P_PACKETS, Q_FEATURES, 3)
-    # Flow A has 3 packets -> 3 images (1,2,3-packet versions); Flow B has 2 -> 2 images = 5 total
-    assert total == 5, f"expected 5 images total, got {total}"
-    print("\npcap_to_dataset.py self-test passed.")
+    distribution = Counter(
+        labels.tolist()
+    )
 
+    for class_id in range(NUM_CLASSES):
+        print(
+            f"    {CLASS_NAMES[class_id]:15s}: "
+            f"{distribution.get(class_id, 0):,}"
+        )
+
+    return feature_df, labels
+
+
+# ============================================================
+# FEATURE MATRIX -> RGB IMAGE
+# ============================================================
+
+def features_to_image(
+    feature_vector,
+    feature_min,
+    feature_max,
+):
+    """
+    Convert one normalized flow feature vector
+    into a deterministic 9 x 1486 x 3 RGB tensor.
+
+    The actual CSV has far fewer than 1486 features.
+
+    Therefore the normalized feature vector is tiled
+    across the required width.
+
+    Channel design:
+        R = normalized feature values
+        G = reversed feature values
+        B = zero
+
+    This keeps the input compatible with the existing
+    9 x 1486 x 3 CNN.
+    """
+
+    values = np.asarray(
+        feature_vector,
+        dtype=np.float32,
+    )
+
+    # Normalize using dataset-wide feature bounds.
+    denominator = (
+        feature_max -
+        feature_min
+    )
+
+    denominator[
+        denominator < 1e-12
+    ] = 1.0
+
+    values = (
+        values - feature_min
+    ) / denominator
+
+    values = np.nan_to_num(
+        values,
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    )
+
+    values = np.clip(
+        values,
+        0.0,
+        1.0,
+    )
+
+    # Repeat feature vector until width is filled.
+    repeated = np.resize(
+        values,
+        IMAGE_WIDTH,
+    )
+
+    # Create 9 rows with small deterministic
+    # cyclic shifts. This avoids producing nine
+    # identical rows while retaining the same flow
+    # representation.
+    rows = np.empty(
+        (
+            IMAGE_HEIGHT,
+            IMAGE_WIDTH,
+        ),
+        dtype=np.float32,
+    )
+
+    for row in range(IMAGE_HEIGHT):
+
+        shift = (
+            row * len(values)
+        ) % IMAGE_WIDTH
+
+        rows[row] = np.roll(
+            repeated,
+            shift,
+        )
+
+    # RGB representation.
+    image = np.zeros(
+        IMAGE_SHAPE,
+        dtype=np.uint8,
+    )
+
+    image[:, :, 0] = (
+        rows * 255.0
+    ).astype(np.uint8)
+
+    image[:, :, 1] = (
+        np.flip(
+            rows,
+            axis=1,
+        ) * 255.0
+    ).astype(np.uint8)
+
+    # Blue remains zero.
+    image[:, :, 2] = 0
+
+    return image
+
+
+# ============================================================
+# DATASET IMAGE CREATION
+# ============================================================
+
+def create_images(
+    feature_df,
+    labels,
+    feature_min,
+    feature_max,
+):
+    images = []
+
+    for index in range(
+        len(feature_df)
+    ):
+
+        if index % 5000 == 0:
+            print(
+                f"[*] Converting flows: "
+                f"{index:,}/{len(feature_df):,}"
+            )
+
+        vector = feature_df.iloc[
+            index
+        ].to_numpy(
+            dtype=np.float32
+        )
+
+        image = features_to_image(
+            vector,
+            feature_min,
+            feature_max,
+        )
+
+        images.append(image)
+
+    if not images:
+        raise RuntimeError(
+            "No images were generated."
+        )
+
+    X = np.stack(
+        images
+    ).astype(
+        np.uint8
+    )
+
+    y = np.asarray(
+        labels,
+        dtype=np.int64,
+    )
+
+    return X, y
+
+
+# ============================================================
+# BALANCED SAMPLING
+# ============================================================
+
+def balance_classes(
+    X,
+    y,
+    max_images_per_class,
+    seed=42,
+):
+    rng = np.random.default_rng(
+        seed
+    )
+
+    selected_indices = []
+
+    print()
+    print("=" * 70)
+    print("[*] CLASS BALANCING")
+    print("=" * 70)
+
+    for class_id in range(
+        NUM_CLASSES
+    ):
+
+        indices = np.where(
+            y == class_id
+        )[0]
+
+        if len(indices) == 0:
+            print(
+                f"[!] {CLASS_NAMES[class_id]:15s}: "
+                f"ZERO samples"
+            )
+            continue
+
+        rng.shuffle(indices)
+
+        if max_images_per_class is None:
+            selected = indices
+        else:
+            selected = indices[
+                :max_images_per_class
+            ]
+
+        selected_indices.extend(
+            selected.tolist()
+        )
+
+        print(
+            f"    {CLASS_NAMES[class_id]:15s}: "
+            f"{len(selected):,}"
+        )
+
+    if not selected_indices:
+        raise RuntimeError(
+            "No samples survived class balancing."
+        )
+
+    rng.shuffle(
+        selected_indices
+    )
+
+    selected_indices = np.asarray(
+        selected_indices,
+        dtype=np.int64,
+    )
+
+    return (
+        X[selected_indices],
+        y[selected_indices],
+    )
+
+
+# ============================================================
+# STRATIFIED SPLIT
+# ============================================================
+
+def stratified_split(
+    X,
+    y,
+    train_ratio=0.70,
+    val_ratio=0.15,
+    seed=42,
+):
+    rng = np.random.default_rng(
+        seed
+    )
+
+    train_indices = []
+    val_indices = []
+    test_indices = []
+
+    for class_id in range(
+        NUM_CLASSES
+    ):
+
+        indices = np.where(
+            y == class_id
+        )[0]
+
+        rng.shuffle(indices)
+
+        n = len(indices)
+
+        if n == 1:
+            train_end = 1
+            val_end = 1
+
+        elif n == 2:
+            train_end = 1
+            val_end = 1
+
+        else:
+            train_end = max(
+                1,
+                int(
+                    n * train_ratio
+                ),
+            )
+
+            val_count = max(
+                1,
+                int(
+                    n * val_ratio
+                ),
+            )
+
+            val_end = min(
+                n - 1,
+                train_end + val_count,
+            )
+
+        train_indices.extend(
+            indices[:train_end]
+            .tolist()
+        )
+
+        val_indices.extend(
+            indices[
+                train_end:val_end
+            ].tolist()
+        )
+
+        test_indices.extend(
+            indices[val_end:]
+            .tolist()
+        )
+
+    rng.shuffle(
+        train_indices
+    )
+
+    rng.shuffle(
+        val_indices
+    )
+
+    rng.shuffle(
+        test_indices
+    )
+
+    train_indices = np.asarray(
+        train_indices,
+        dtype=np.int64,
+    )
+
+    val_indices = np.asarray(
+        val_indices,
+        dtype=np.int64,
+    )
+
+    test_indices = np.asarray(
+        test_indices,
+        dtype=np.int64,
+    )
+
+    return {
+        "train": (
+            X[train_indices],
+            y[train_indices],
+        ),
+        "val": (
+            X[val_indices],
+            y[val_indices],
+        ),
+        "test": (
+            X[test_indices],
+            y[test_indices],
+        ),
+    }
+
+
+# ============================================================
+# PRINT SPLIT DISTRIBUTION
+# ============================================================
+
+def print_distribution(
+    name,
+    y,
+):
+    print()
+    print(
+        f"[*] {name} distribution"
+    )
+
+    counts = Counter(
+        y.tolist()
+    )
+
+    for class_id in range(
+        NUM_CLASSES
+    ):
+        print(
+            f"    {CLASS_NAMES[class_id]:15s}: "
+            f"{counts.get(class_id, 0):,}"
+        )
+
+
+# ============================================================
+# MAIN DATASET BUILDER
+# ============================================================
+
+def build_dataset(
+    csv_paths,
+    out_dir,
+    max_images_per_class=2500,
+    seed=42,
+):
+    rng = np.random.default_rng(
+        seed
+    )
+
+    print()
+    print("=" * 70)
+    print(
+        "CSV-ONLY 9-CLASS DATASET BUILDER"
+    )
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # LOAD ALL CSV FILES
+    # --------------------------------------------------------
+
+    all_features = []
+    all_labels = []
+
+    for csv_path in csv_paths:
+
+        feature_df, labels = (
+            load_csv_file(
+                csv_path
+            )
+        )
+
+        all_features.append(
+            feature_df
+        )
+
+        all_labels.append(
+            labels
+        )
+
+    if not all_features:
+        raise RuntimeError(
+            "No CSV files were loaded."
+        )
+
+    # --------------------------------------------------------
+    # ALIGN FEATURES
+    # --------------------------------------------------------
+
+    print()
+    print(
+        "[*] Combining CSV files..."
+    )
+
+    combined_features = pd.concat(
+        all_features,
+        ignore_index=True,
+        sort=False,
+    )
+
+    combined_labels = np.concatenate(
+        all_labels
+    )
+
+    # Convert any newly introduced missing
+    # columns to zero.
+    combined_features = (
+        combined_features
+        .replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+        .fillna(0.0)
+    )
+
+    # Numeric conversion.
+    combined_features = (
+        combined_features
+        .apply(
+            pd.to_numeric,
+            errors="coerce",
+        )
+        .fillna(0.0)
+        .astype(np.float32)
+    )
+
+    print(
+        f"[*] Combined flows: "
+        f"{len(combined_labels):,}"
+    )
+
+    print(
+        f"[*] Feature count: "
+        f"{combined_features.shape[1]}"
+    )
+
+   # --------------------------------------------------------
+# REMOVE CONSTANT / DUPLICATE COLUMNS
+# --------------------------------------------------------
+
+# Duplicate feature columns can exist in
+# CICFlowMeter exports.
+    # --------------------------------------------------------
+# REMOVE DUPLICATE FEATURE COLUMNS
+# --------------------------------------------------------
+
+# CICFlowMeter exports can contain duplicate feature
+# columns. Remove duplicate COLUMNS only.
+#
+# IMPORTANT:
+# Do NOT call DataFrame.drop_duplicates() here.
+# That attempts to compare millions of rows and can
+# consume huge amounts of memory/time.
+
+    before = combined_features.shape[1]
+
+    combined_features = combined_features.loc[
+        :,
+        ~combined_features.columns.duplicated()
+    ].copy()
+
+    after = combined_features.shape[1]
+
+    if after != before:
+        print(
+            f"[*] Removed "
+            f"{before - after} duplicate "
+            f"feature columns."
+        )
+
+
+    # --------------------------------------------------------
+    # REMOVE CONSTANT FEATURE COLUMNS
+    # --------------------------------------------------------
+
+    # Remove columns whose values never change.
+    # This is much cheaper than row-level deduplication.
+
+        constant_columns = [
+            column
+            for column in combined_features.columns
+            if combined_features[column].nunique(
+                dropna=False
+            ) <= 1
+        ]
+
+        if constant_columns:
+            combined_features = combined_features.drop(
+                columns=constant_columns
+            )
+
+            print(
+                f"[*] Removed "
+                f"{len(constant_columns)} constant "
+                f"feature columns."
+            )
+
+
+# --------------------------------------------------------
+# REMOVE INVALID ROWS
+# --------------------------------------------------------
+
+    finite_mask = np.isfinite(
+        combined_features.to_numpy(
+            dtype=np.float64,
+            copy=False
+        )
+    ).all(axis=1)
+
+    combined_features = (
+        combined_features.loc[
+            finite_mask
+        ]
+        .reset_index(drop=True)
+    )
+
+    combined_labels = (
+        combined_labels[
+            finite_mask
+        ]
+    )
+
+    print(
+        f"[*] Valid rows after cleaning: "
+        f"{len(combined_features):,}"
+    )
+
+    print(
+        f"[*] Final feature count: "
+        f"{combined_features.shape[1]}"
+    )
+
+    # --------------------------------------------------------
+    # FEATURE NORMALIZATION
+    # --------------------------------------------------------
+
+    feature_array = (
+        combined_features.to_numpy(
+            dtype=np.float32
+        )
+    )
+
+    feature_min = np.nanmin(
+        feature_array,
+        axis=0,
+    )
+
+    feature_max = np.nanmax(
+        feature_array,
+        axis=0,
+    )
+
+    feature_min = np.nan_to_num(
+        feature_min,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    feature_max = np.nan_to_num(
+        feature_max,
+        nan=1.0,
+        posinf=1.0,
+        neginf=0.0,
+    )
+
+    # --------------------------------------------------------
+    # SAMPLE BEFORE IMAGE CREATION
+    # --------------------------------------------------------
+
+    # We cap BEFORE creating the huge image arrays.
+    # This saves a large amount of RAM.
+    selected_indices = []
+
+    print()
+    print(
+        "=" * 70
+    )
+    print(
+        "[*] SELECTING BALANCED FLOWS"
+    )
+    print(
+        "=" * 70
+    )
+
+    for class_id in range(
+        NUM_CLASSES
+    ):
+
+        indices = np.where(
+            combined_labels == class_id
+        )[0]
+
+        rng.shuffle(indices)
+
+        if len(indices) == 0:
+            print(
+                f"[!] {CLASS_NAMES[class_id]:15s}: "
+                f"ZERO"
+            )
+            continue
+
+        if max_images_per_class is None:
+            selected = indices
+        else:
+            selected = indices[
+                :max_images_per_class
+            ]
+
+        selected_indices.extend(
+            selected.tolist()
+        )
+
+        print(
+            f"    {CLASS_NAMES[class_id]:15s}: "
+            f"{len(selected):,}"
+        )
+
+    if not selected_indices:
+        raise RuntimeError(
+            "No labelled flows available."
+        )
+
+    rng.shuffle(
+        selected_indices
+    )
+
+    selected_indices = np.asarray(
+        selected_indices,
+        dtype=np.int64,
+    )
+
+    selected_features = (
+        feature_array[
+            selected_indices
+        ]
+    )
+
+    selected_labels = (
+        combined_labels[
+            selected_indices
+        ]
+    )
+
+    print(
+        f"\n[*] Selected total flows: "
+        f"{len(selected_labels):,}"
+    )
+
+    # --------------------------------------------------------
+    # CREATE IMAGES
+    # --------------------------------------------------------
+
+    X, y = create_images(
+        pd.DataFrame(
+            selected_features
+        ),
+        selected_labels,
+        feature_min,
+        feature_max,
+    )
+
+    print()
+    print(
+        f"[*] Image dataset shape: "
+        f"{X.shape}"
+    )
+
+    print(
+        f"[*] Label shape: "
+        f"{y.shape}"
+    )
+
+    # --------------------------------------------------------
+    # SPLIT
+    # --------------------------------------------------------
+
+    splits = stratified_split(
+        X,
+        y,
+        train_ratio=0.70,
+        val_ratio=0.15,
+        seed=seed,
+    )
+
+    train_X, train_y = splits[
+        "train"
+    ]
+
+    val_X, val_y = splits[
+        "val"
+    ]
+
+    test_X, test_y = splits[
+        "test"
+    ]
+
+    print_distribution(
+        "TRAIN",
+        train_y,
+    )
+
+    print_distribution(
+        "VALIDATION",
+        val_y,
+    )
+
+    print_distribution(
+        "TEST",
+        test_y,
+    )
+
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
+
+    os.makedirs(
+        out_dir,
+        exist_ok=True,
+    )
+
+    train_path = os.path.join(
+        out_dir,
+        "train.npz",
+    )
+
+    val_path = os.path.join(
+        out_dir,
+        "val.npz",
+    )
+
+    test_path = os.path.join(
+        out_dir,
+        "test.npz",
+    )
+
+    print()
+    print(
+        "[*] Saving dataset..."
+    )
+
+    np.savez_compressed(
+        train_path,
+        X=train_X,
+        y=train_y,
+    )
+
+    np.savez_compressed(
+        val_path,
+        X=val_X,
+        y=val_y,
+    )
+
+    np.savez_compressed(
+        test_path,
+        X=test_X,
+        y=test_y,
+    )
+
+    # --------------------------------------------------------
+    # SAVE FEATURE METADATA
+    # --------------------------------------------------------
+
+    metadata_path = os.path.join(
+        out_dir,
+        "feature_metadata.npz",
+    )
+
+    np.savez_compressed(
+        metadata_path,
+        feature_min=feature_min,
+        feature_max=feature_max,
+    )
+
+    print()
+    print("=" * 70)
+    print(
+        "[+] DATASET BUILD COMPLETE"
+    )
+    print("=" * 70)
+
+    print(
+        f"[*] Train: {train_path}"
+    )
+
+    print(
+        f"[*] Validation: {val_path}"
+    )
+
+    print(
+        f"[*] Test: {test_path}"
+    )
+
+    print(
+        f"[*] Metadata: {metadata_path}"
+    )
+
+    print(
+        f"[*] Total images: {len(X):,}"
+    )
+
+    print(
+        f"[*] Image shape: {X.shape[1:]}"
+    )
+
+    print("=" * 70)
+
+
+# ============================================================
+# SELF TEST
+# ============================================================
+
+def self_test():
+    assert len(CLASS_NAMES) == 9
+
+    assert map_label(
+        "BENIGN"
+    ) == 0
+
+    assert map_label(
+        "DoS Hulk"
+    ) == 1
+
+    assert map_label(
+        "DDoS"
+    ) == 2
+
+    assert map_label(
+        "PortScan"
+    ) == 3
+
+    assert map_label(
+        "FTP-Patator"
+    ) == 4
+
+    assert map_label(
+        "SSH-Patator"
+    ) == 4
+
+    assert map_label(
+        "Bot"
+    ) == 5
+
+    assert map_label(
+        "Web Attack - XSS"
+    ) == 6
+
+    assert map_label(
+        "Web Attack - SQL Injection"
+    ) == 6
+
+    assert map_label(
+        "Infiltration"
+    ) == 7
+
+    assert map_label(
+        "Heartbleed"
+    ) == 8
+
+    # Small image test.
+    vector = np.arange(
+        78,
+        dtype=np.float32,
+    )
+
+    feature_min = np.zeros(
+        78,
+        dtype=np.float32,
+    )
+
+    feature_max = np.ones(
+        78,
+        dtype=np.float32,
+    ) * 100.0
+
+    image = features_to_image(
+        vector,
+        feature_min,
+        feature_max,
+    )
+
+    assert image.shape == IMAGE_SHAPE
+    assert image.dtype == np.uint8
+
+    print(
+        "[+] Self-test passed."
+    )
+
+
+# ============================================================
+# CLI
+# ============================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--pcap", nargs="+",
-                         help="Path(s) to raw .pcap file(s). Pass multiple to combine days, "
-                              "e.g. --pcap dataset/pcap/Friday-WorkingHours.pcap dataset/pcap/Tuesday-WorkingHours.pcap")
-    parser.add_argument("--labels", nargs="+",
-                         help="Path(s) to CICIDS2017 ground-truth labelled-flow CSV(s). "
-                              "Pass ALL CSVs for every pcap you listed above — e.g. Friday needs "
-                              "its 3 CSVs (Morning, Afternoon-DDos, Afternoon-PortScan) even though "
-                              "it's 1 pcap file.")
-    parser.add_argument("--out", default=os.path.join("dataset", "images"),
-                         help="Output directory for train/val/test .npz files")
-    parser.add_argument("--max-packets", type=int, default=None,
-                         help="For a quick spot-check, read only this many packets PER pcap file "
-                              "instead of the whole thing, e.g. --max-packets 200000")
-    parser.add_argument("--max-images-per-class", type=int, default=15000,
-                         help="Cap on images kept per class, to bound memory and keep classes "
-                              "balanced. Set to a smaller number (e.g. 3000) for a faster first "
-                              "run, or 0/negative to disable the cap entirely.")
-    parser.add_argument("--self-test", action="store_true",
-                         help="Run the built-in self-test on synthetic data instead of real files")
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Build 9-class RGB image dataset "
+            "directly from CIC-IDS2017 CSV files."
+        )
+    )
+
+    parser.add_argument(
+        "--labels",
+        nargs="+",
+        required=False,
+        help="CIC-IDS2017 labelled CSV files.",
+    )
+
+    parser.add_argument(
+        "--out",
+        default=os.path.join(
+            "dataset",
+            "images_final",
+        ),
+        help="Output directory.",
+    )
+
+    parser.add_argument(
+        "--max-images-per-class",
+        type=int,
+        default=2500,
+        help="Maximum samples per class.",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed.",
+    )
+
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run self-test.",
+    )
+
     args = parser.parse_args()
 
-    if args.self_test or not (args.pcap and args.labels):
-        _self_test()
+    if args.self_test or not args.labels:
+        self_test()
+
     else:
-        cap = args.max_images_per_class if args.max_images_per_class and args.max_images_per_class > 0 else None
-        build_dataset(args.pcap, args.labels, args.out,
-                      max_packets=args.max_packets, max_images_per_class=cap)
+
+        cap = (
+            args.max_images_per_class
+            if args.max_images_per_class > 0
+            else None
+        )
+
+        build_dataset(
+            csv_paths=args.labels,
+            out_dir=args.out,
+            max_images_per_class=cap,
+            seed=args.seed,
+        )
